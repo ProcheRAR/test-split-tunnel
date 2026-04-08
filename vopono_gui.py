@@ -183,7 +183,8 @@ class SudoWrapper:
     """
 
     def __init__(self):
-        self._tmpdir: str | None = None
+        self._askpass_dir: str | None = None   # persistent — lives for app lifetime
+        self._sudo_dir: str | None = None      # recreated per connection
         self._askpass_path: str | None = None
         self._real_sudo: str = shutil.which("sudo") or "/usr/bin/sudo"
         self._find_or_create_askpass()
@@ -218,7 +219,7 @@ class SudoWrapper:
                 f'exec {tool_path} --password "Password required for vopono:" 2>/dev/null\n'
             )
         script.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-        self._tmpdir = d  # will be cleaned up
+        self._askpass_dir = d
         return str(script)
 
     @property
@@ -231,10 +232,10 @@ class SudoWrapper:
 
     def create(self) -> str:
         """Create temp dir with a 'sudo' wrapper that injects -A flag."""
-        if self._tmpdir is None:
-            self._tmpdir = tempfile.mkdtemp(prefix="vopono_gui_sudo_")
+        if self._sudo_dir is None or not os.path.isdir(self._sudo_dir):
+            self._sudo_dir = tempfile.mkdtemp(prefix="vopono_gui_sudo_")
 
-        sudo_script = Path(self._tmpdir) / "sudo"
+        sudo_script = Path(self._sudo_dir) / "sudo"
         # Wrapper calls the REAL sudo with -A added, preserving all args
         sudo_script.write_text(
             '#!/bin/bash\n'
@@ -242,17 +243,25 @@ class SudoWrapper:
             f'exec {self._real_sudo} -A "$@"\n'
         )
         sudo_script.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-        return self._tmpdir
+        return self._sudo_dir
 
     def cleanup(self):
-        if self._tmpdir and os.path.isdir(self._tmpdir):
-            shutil.rmtree(self._tmpdir, ignore_errors=True)
-            self._tmpdir = None
+        """Remove the sudo wrapper dir only. Askpass script persists."""
+        if self._sudo_dir and os.path.isdir(self._sudo_dir):
+            shutil.rmtree(self._sudo_dir, ignore_errors=True)
+            self._sudo_dir = None
+
+    def cleanup_all(self):
+        """Full cleanup on app exit — remove both dirs."""
+        self.cleanup()
+        if self._askpass_dir and os.path.isdir(self._askpass_dir):
+            shutil.rmtree(self._askpass_dir, ignore_errors=True)
+            self._askpass_dir = None
 
     def make_env(self) -> dict[str, str]:
         env = os.environ.copy()
-        if self._tmpdir:
-            env["PATH"] = self._tmpdir + ":" + env.get("PATH", "")
+        if self._sudo_dir:
+            env["PATH"] = self._sudo_dir + ":" + env.get("PATH", "")
         if self._askpass_path:
             env["SUDO_ASKPASS"] = self._askpass_path
         return env
@@ -876,7 +885,7 @@ class VoponoWindow(Gtk.ApplicationWindow):
         if data:
             text = data.decode("utf-8", errors="replace")
             self._log(text)
-            if "Created netns" in text or "Namespace exists" in text:
+            if "network namespace" in text or "Application" in text and "launched" in text:
                 self._set_state(self.State.CONNECTED)
         return not (condition & GLib.IOCondition.HUP)
 
@@ -897,9 +906,13 @@ class VoponoWindow(Gtk.ApplicationWindow):
             return False
         ret = self._process.poll()
         if ret is not None:
-            if self._state == self.State.CONNECTING:
+            if ret == 0 or ret < 0:
+                # 0 = normal exit, negative = killed by signal (-15=SIGTERM, -9=SIGKILL)
+                self._log(f"\n■ Процесс завершён\n")
+                self._set_state(self.State.DISCONNECTED)
+            elif self._state == self.State.CONNECTING:
                 self._set_state(self.State.ERROR, f"процесс завершился (код {ret})")
-            elif self._state != self.State.DISCONNECTED:
+            else:
                 self._log(f"\n■ Процесс завершён (код {ret})\n")
                 self._set_state(self.State.DISCONNECTED)
             self._cleanup_process()
@@ -1059,7 +1072,7 @@ class VoponoWindow(Gtk.ApplicationWindow):
             self._stop_process()
             GLib.timeout_add(500, self._check_and_quit)
             return True
-        self._sudo_wrapper.cleanup()
+        self._sudo_wrapper.cleanup_all()
         return False
 
     def _check_and_quit(self) -> bool:
@@ -1147,7 +1160,7 @@ class VoponoApp(Gtk.Application):
                 self._window._stop_process()
                 GLib.timeout_add(500, self._force_quit)
                 return
-            self._window._sudo_wrapper.cleanup()
+            self._window._sudo_wrapper.cleanup_all()
         self.quit()
 
     def _force_quit(self) -> bool:
