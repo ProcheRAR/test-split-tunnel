@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Vopono GUI
+Comment=GUI wrapper for vopono VPN tunnels (custom WireGuard)
+Exec=python3 /home/user/путь до vopono_gui.py
+Icon=network-vpn
+Terminal=false
+Categories=Network;System;
+Keywords=vpn;vopono;wireguard;
