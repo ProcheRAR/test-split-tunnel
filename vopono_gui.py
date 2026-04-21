@@ -39,6 +39,7 @@ LAST_CONFIG_FILE = CONFIG_DIR / "last_config"
 LAST_CUSTOM_CMD = CONFIG_DIR / "last_custom_cmd"
 LAST_DNS_FILE = CONFIG_DIR / "last_dns"
 SELECTED_APPS_FILE = CONFIG_DIR / "selected_apps"
+FAVORITES_FILE = CONFIG_DIR / "favorites"
 
 DESKTOP_DIRS = [
     Path("/usr/share/applications"),
@@ -205,19 +206,30 @@ class SudoWrapper:
                 return
 
     def _create_askpass_script(self, tool: str, tool_path: str) -> str:
-        """Create a small askpass script using zenity or kdialog."""
+        """Create a small askpass script using zenity or kdialog with password caching."""
         d = tempfile.mkdtemp(prefix="vopono_gui_askpass_")
         script = Path(d) / "vopono-askpass"
+        cache_file = Path(d) / ".cached_pw"
         if tool == "zenity":
-            script.write_text(
-                '#!/bin/bash\n'
-                f'exec {tool_path} --password --title="Vopono GUI" 2>/dev/null\n'
-            )
+            prompt_cmd = f'{tool_path} --password --title="Vopono GUI" 2>/dev/null'
         elif tool == "kdialog":
-            script.write_text(
-                '#!/bin/bash\n'
-                f'exec {tool_path} --password "Password required for vopono:" 2>/dev/null\n'
-            )
+            prompt_cmd = f'{tool_path} --password "Password required for vopono:" 2>/dev/null'
+        else:
+            prompt_cmd = 'read -rsp "" PW && echo "$PW"'
+        # Script: if cached password exists, return it; otherwise prompt and cache
+        script.write_text(
+            '#!/bin/bash\n'
+            f'CACHE="{cache_file}"\n'
+            'if [ -f "$CACHE" ]; then\n'
+            '  cat "$CACHE"\n'
+            '  exit 0\n'
+            'fi\n'
+            f'PW=$({prompt_cmd})\n'
+            'if [ $? -ne 0 ] || [ -z "$PW" ]; then exit 1; fi\n'
+            'echo "$PW" > "$CACHE"\n'
+            'chmod 600 "$CACHE"\n'
+            'echo "$PW"\n'
+        )
         script.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
         self._askpass_dir = d
         return str(script)
@@ -236,7 +248,6 @@ class SudoWrapper:
             self._sudo_dir = tempfile.mkdtemp(prefix="vopono_gui_sudo_")
 
         sudo_script = Path(self._sudo_dir) / "sudo"
-        # Wrapper calls the REAL sudo with -A added, preserving all args
         sudo_script.write_text(
             '#!/bin/bash\n'
             '# vopono-gui: wrapper that adds -A for graphical askpass\n'
@@ -293,21 +304,30 @@ def _set_nonblocking(fd: int):
 class AppIcon(Gtk.EventBox):
     """Clickable app icon with label."""
 
-    def __init__(self, app: DesktopApp, on_toggle):
+    def __init__(self, app: DesktopApp, on_toggle, on_fav_toggle=None):
         super().__init__()
         self.app = app
         self._selected = False
+        self._favorite = False
         self._on_toggle = on_toggle
+        self._on_fav_toggle = on_fav_toggle
 
         self._box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self._box.set_halign(Gtk.Align.CENTER)
         self._box.set_valign(Gtk.Align.CENTER)
         self._box.get_style_context().add_class("app-item")
 
-        # Icon
+        # Icon + star overlay
+        icon_overlay = Gtk.Overlay()
         self._image = Gtk.Image()
         self._load_icon(app.icon_name)
-        self._box.pack_start(self._image, False, False, 0)
+        icon_overlay.add(self._image)
+
+        self._star_label = Gtk.Label(label="")
+        self._star_label.set_halign(Gtk.Align.END)
+        self._star_label.set_valign(Gtk.Align.START)
+        icon_overlay.add_overlay(self._star_label)
+        self._box.pack_start(icon_overlay, False, False, 0)
 
         # Label
         self._label = Gtk.Label(label=app.name)
@@ -345,13 +365,26 @@ class AppIcon(Gtk.EventBox):
         else:
             self._image.set_from_icon_name("application-x-executable", Gtk.IconSize.DIALOG)
 
-    def _on_click(self, _w, _evt):
+    def _on_click(self, _w, evt):
+        if evt.button == 3:  # Right-click → toggle favorite
+            self.set_favorite(not self._favorite)
+            if self._on_fav_toggle:
+                self._on_fav_toggle(self)
+            return True
         self.set_selected(not self._selected)
         self._on_toggle(self)
 
     @property
     def selected(self):
         return self._selected
+
+    @property
+    def favorite(self):
+        return self._favorite
+
+    def set_favorite(self, val: bool):
+        self._favorite = val
+        self._star_label.set_text("★" if val else "")
 
     def set_selected(self, val: bool):
         self._selected = val
@@ -393,13 +426,17 @@ class VoponoWindow(Gtk.ApplicationWindow):
         self._io_source_err: int | None = None
         self._kill_timeout_id: int | None = None
         self._tmp_config: str | None = None
+        self._ns_name: str | None = None  # active namespace name
+        self._launched_procs: list[subprocess.Popen] = []  # app processes
 
         self._sudo_wrapper = SudoWrapper()
         self._all_apps = discover_apps()
         self._app_icons: list[AppIcon] = []
         self._selected_apps: list[DesktopApp] = []
+        self._favorite_names: set[str] = set()
 
         self._apply_css()
+        self._load_favorites()
         self._build_ui()
         self._restore_selected_apps()
         self._update_state_ui()
@@ -475,6 +512,7 @@ class VoponoWindow(Gtk.ApplicationWindow):
         self._search_entry.set_placeholder_text("Поиск…")
 
         self._search_entry.connect("search-changed", self._on_search)
+        self._search_entry.connect("key-press-event", self._on_search_key)
         search_row.pack_start(self._search_entry, True, True, 0)
 
         self._selected_label = Gtk.Label(label="")
@@ -497,9 +535,14 @@ class VoponoWindow(Gtk.ApplicationWindow):
         self._app_flow.set_min_children_per_line(4)
         self._app_flow.set_selection_mode(Gtk.SelectionMode.NONE)
         self._app_flow.set_homogeneous(True)
+        self._app_flow.set_sort_func(self._sort_apps)
+        self._app_flow.set_activate_on_single_click(False)
+        self._app_flow.connect("child-activated", self._on_flow_activate)
 
         for app in self._all_apps:
-            icon = AppIcon(app, self._on_app_toggled)
+            icon = AppIcon(app, self._on_app_toggled, self._on_fav_toggled)
+            if app.name in self._favorite_names:
+                icon.set_favorite(True)
             self._app_icons.append(icon)
             self._app_flow.add(icon)
 
@@ -526,20 +569,25 @@ class VoponoWindow(Gtk.ApplicationWindow):
         btn_row.set_halign(Gtk.Align.CENTER)
         btn_row.set_margin_top(4)
 
-        self._connect_btn = Gtk.Button(label="Подключиться")
-        self._connect_btn.set_size_request(200, -1)
-        self._connect_btn.get_style_context().add_class(Gtk.STYLE_CLASS_SUGGESTED_ACTION)
-        self._connect_btn.connect("clicked", self._on_connect)
-        btn_row.pack_start(self._connect_btn, False, False, 0)
+        self._tunnel_btn = Gtk.Button(label="Поднять туннель")
+        self._tunnel_btn.set_size_request(180, -1)
+        self._tunnel_btn.get_style_context().add_class(Gtk.STYLE_CLASS_SUGGESTED_ACTION)
+        self._tunnel_btn.connect("clicked", self._on_tunnel_up)
+        btn_row.pack_start(self._tunnel_btn, False, False, 0)
 
-        self._disconnect_btn = Gtk.Button(label="Остановить")
-        self._disconnect_btn.set_size_request(200, -1)
+        self._launch_btn = Gtk.Button(label="Запустить ▶")
+        self._launch_btn.set_size_request(160, -1)
+        self._launch_btn.connect("clicked", self._on_launch_app)
+        btn_row.pack_start(self._launch_btn, False, False, 0)
+
+        self._disconnect_btn = Gtk.Button(label="Отключить")
+        self._disconnect_btn.set_size_request(160, -1)
         self._disconnect_btn.get_style_context().add_class(Gtk.STYLE_CLASS_DESTRUCTIVE_ACTION)
         self._disconnect_btn.connect("clicked", self._on_disconnect)
         btn_row.pack_start(self._disconnect_btn, False, False, 0)
 
-        self._clean_btn = Gtk.Button(label="🧹 Очистка")
-        self._clean_btn.set_tooltip_text("Аварийная очистка (vopono clean) — удалить зависшие namespace")
+        self._clean_btn = Gtk.Button(label="🧹")
+        self._clean_btn.set_tooltip_text("Аварийная очистка — удалить зависшие namespace")
         self._clean_btn.connect("clicked", self._on_clean)
         btn_row.pack_start(self._clean_btn, False, False, 0)
 
@@ -620,6 +668,36 @@ class VoponoWindow(Gtk.ApplicationWindow):
                 self._selected_apps.remove(icon.app)
         self._update_selected_label()
 
+    def _on_fav_toggled(self, icon: AppIcon):
+        if icon.favorite:
+            self._favorite_names.add(icon.app.name)
+        else:
+            self._favorite_names.discard(icon.app.name)
+        self._save_favorites()
+        self._app_flow.invalidate_sort()
+
+    def _sort_apps(self, child1, child2):
+        """Sort: favorites first, then alphabetical."""
+        icon1 = child1.get_child()
+        icon2 = child2.get_child()
+        if not isinstance(icon1, AppIcon) or not isinstance(icon2, AppIcon):
+            return 0
+        f1 = icon1.favorite
+        f2 = icon2.favorite
+        if f1 and not f2:
+            return -1
+        if f2 and not f1:
+            return 1
+        return (icon1.app.name.lower() > icon2.app.name.lower()) - (icon1.app.name.lower() < icon2.app.name.lower())
+
+    def _load_favorites(self):
+        saved = _load(FAVORITES_FILE)
+        if saved:
+            self._favorite_names = set(saved.strip().split("\n"))
+
+    def _save_favorites(self):
+        _save(FAVORITES_FILE, "\n".join(sorted(self._favorite_names)))
+
     def _update_selected_label(self):
         n = len(self._selected_apps)
         custom = self._custom_cmd_entry.get_text().strip()
@@ -637,6 +715,29 @@ class VoponoWindow(Gtk.ApplicationWindow):
         for icon in self._app_icons:
             visible = query in icon.app.name.lower() or query in icon.app.clean_exec.lower()
             icon.get_parent().set_visible(visible)  # FlowBoxChild
+
+    def _on_search_key(self, entry, event):
+        """Enter in search: toggle the first matching app, then clear."""
+        if event.keyval not in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            return False
+        query = entry.get_text().lower().strip()
+        if not query:
+            return False
+        matches = [i for i in self._app_icons
+                   if query in i.app.name.lower() or query in i.app.clean_exec.lower()]
+        if matches:
+            icon = matches[0]
+            icon.set_selected(not icon.selected)
+            self._on_app_toggled(icon)
+        entry.set_text("")
+        return True
+
+    def _on_flow_activate(self, flowbox, child):
+        """Enter/double-click on a FlowBox child toggles selection."""
+        icon = child.get_child()
+        if isinstance(icon, AppIcon):
+            icon.set_selected(not icon.selected)
+            self._on_app_toggled(icon)
 
     def _restore_selected_apps(self):
         saved = _load(SELECTED_APPS_FILE)
@@ -689,20 +790,25 @@ class VoponoWindow(Gtk.ApplicationWindow):
         match self._state:
             case self.State.DISCONNECTED:
                 self._status_label.set_text("● Отключено")
-                self._connect_btn.set_sensitive(True)
+                self._tunnel_btn.set_sensitive(True)
+                self._launch_btn.set_sensitive(False)
                 self._disconnect_btn.set_sensitive(False)
             case self.State.CONNECTING:
                 self._status_label.set_text("● Подключение…")
-                self._connect_btn.set_sensitive(False)
+                self._tunnel_btn.set_sensitive(False)
+                self._launch_btn.set_sensitive(False)
                 self._disconnect_btn.set_sensitive(True)
             case self.State.CONNECTED:
+                ns = self._ns_name or ""
                 name = detail or (os.path.basename(self._config_path) if self._config_path else "")
-                self._status_label.set_text(f"● Подключено — {name}")
-                self._connect_btn.set_sensitive(False)
+                self._status_label.set_text(f"● Туннель активен — {name}")
+                self._tunnel_btn.set_sensitive(False)
+                self._launch_btn.set_sensitive(True)
                 self._disconnect_btn.set_sensitive(True)
             case self.State.ERROR:
                 self._status_label.set_text(f"● Ошибка{': ' + detail if detail else ''}")
-                self._connect_btn.set_sensitive(True)
+                self._tunnel_btn.set_sensitive(True)
+                self._launch_btn.set_sensitive(False)
                 self._disconnect_btn.set_sensitive(False)
 
     def _update_tray(self):
@@ -803,14 +909,10 @@ class VoponoWindow(Gtk.ApplicationWindow):
             f.write('\n'.join(lines) + '\n')
         return tmp_path
 
-    def _on_connect(self, _btn):
+    def _on_tunnel_up(self, _btn):
+        """Create persistent namespace via vopono --create-netns-only."""
         if not self._config_path or not os.path.isfile(self._config_path):
             self._set_state(self.State.ERROR, "конфиг не выбран или не найден")
-            return
-
-        app_cmd = self._build_app_command()
-        if not app_cmd:
-            self._set_state(self.State.ERROR, "не выбрано ни одного приложения")
             return
 
         # Save state
@@ -825,19 +927,21 @@ class VoponoWindow(Gtk.ApplicationWindow):
             self._set_state(self.State.ERROR, f"ошибка чтения конфига: {exc}")
             return
 
-        # Build vopono command
-        cmd = ["vopono", "-v", "exec", "--custom", self._tmp_config,
+        # Build vopono command with --create-netns-only
+        cmd = ["vopono", "-v", "exec", "--create-netns-only",
+               "--custom", self._tmp_config,
                "--protocol", "wireguard", "--disable-ipv6"]
 
         dns = self._dns_entry.get_text().strip()
         if dns:
             cmd.extend(["--dns", dns])
 
-        cmd.append(app_cmd)
+        cmd.append("none")
 
         self._log_buffer.set_text("")
         self._log(f"▶ {' '.join(cmd)}\n\n")
         self._set_state(self.State.CONNECTING)
+        self._ns_name = None
 
         # Create sudo wrapper
         wrapper_dir = self._sudo_wrapper.create()
@@ -876,6 +980,57 @@ class VoponoWindow(Gtk.ApplicationWindow):
 
         GLib.timeout_add(500, self._poll_process)
 
+    def _on_launch_app(self, _btn):
+        """Launch selected apps in the existing namespace."""
+        if not self._ns_name:
+            self._set_state(self.State.ERROR, "туннель не активен")
+            return
+
+        app_cmd = self._build_app_command()
+        if not app_cmd:
+            self._set_state(self.State.ERROR, "не выбрано ни одного приложения")
+            return
+
+        self._save_selected_apps()
+
+        user = os.environ.get("USER", "nobody")
+        # Pass ALL user env vars so apps get themes, dbus, wayland, etc.
+        skip_vars = {"SUDO_ASKPASS", "SUDO_COMMAND", "SUDO_USER", "SUDO_GID",
+                     "SUDO_UID", "MAIL", "LOGNAME", "PATH", "SHELL", "TERM",
+                     "SHLVL", "_", "OLDPWD", "PWD"}
+        env_args = [f"{k}={v}" for k, v in os.environ.items() if k not in skip_vars]
+
+        # Use runuser to avoid double-password prompt
+        # sudo (our wrapper) -> ip netns exec -> runuser -> env -> app
+        cmd = ["sudo", "ip", "netns", "exec", self._ns_name,
+               "runuser", "-u", user, "--",
+               "env"] + env_args + ["bash", "-c", app_cmd]
+
+        # Reuse existing sudo wrapper (created in _on_tunnel_up)
+        env = self._sudo_wrapper.make_env()
+
+        # Refresh sudo timestamp so we don't get a second password prompt
+        try:
+            subprocess.run(["sudo", "-v", "-n"], env=env,
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+        self._log(f"\n▶ Запуск в {self._ns_name}: {app_cmd}\n")
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                preexec_fn=os.setsid,
+            )
+            self._launched_procs.append(proc)
+            self._log(f"  PID: {proc.pid}\n")
+        except Exception as exc:
+            self._log(f"  ⚠ Ошибка запуска: {exc}\n")
+
     def _read_io(self, fd, condition):
         try:
             data = fd.read(8192)
@@ -885,7 +1040,12 @@ class VoponoWindow(Gtk.ApplicationWindow):
         if data:
             text = data.decode("utf-8", errors="replace")
             self._log(text)
-            if "network namespace" in text or "Application" in text and "launched" in text:
+            # Parse namespace name from vopono output
+            m = re.search(r'Created new network namespace:\s+(\S+)', text)
+            if m:
+                self._ns_name = m.group(1)
+                self._set_state(self.State.CONNECTED)
+            elif 'will leave network namespace alive' in text:
                 self._set_state(self.State.CONNECTED)
         return not (condition & GLib.IOCondition.HUP)
 
@@ -1002,12 +1162,13 @@ class VoponoWindow(Gtk.ApplicationWindow):
         self._log("\n⏹ Отключение…\n")
         try:
             if self._pgid:
-                os.killpg(self._pgid, signal.SIGTERM)
+                # SIGINT = Ctrl+C. Vopono cleans up namespace on SIGINT.
+                os.killpg(self._pgid, signal.SIGINT)
             else:
-                self._process.terminate()
+                self._process.send_signal(signal.SIGINT)
         except ProcessLookupError:
             pass
-        self._kill_timeout_id = GLib.timeout_add(3000, self._force_kill)
+        self._kill_timeout_id = GLib.timeout_add(5000, self._force_kill)
 
     def _force_kill(self) -> bool:
         self._kill_timeout_id = None
@@ -1032,6 +1193,15 @@ class VoponoWindow(Gtk.ApplicationWindow):
         self._io_source_out = self._io_source_err = self._kill_timeout_id = None
         self._process = None
         self._pgid = None
+        self._ns_name = None
+        # Kill any launched app processes
+        for proc in self._launched_procs:
+            try:
+                if proc.poll() is None:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+        self._launched_procs.clear()
         self._sudo_wrapper.cleanup()
         # Remove temp config
         if self._tmp_config and os.path.isfile(self._tmp_config):
@@ -1123,12 +1293,12 @@ class VoponoApp(Gtk.Application):
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        self._tray_connect = Gtk.MenuItem(label="Подключиться")
+        self._tray_connect = Gtk.MenuItem(label="Поднять туннель")
         self._tray_connect.connect("activate", lambda _: (
-            self._window.present(), self._window._on_connect(None)))
+            self._window.present(), self._window._on_tunnel_up(None)))
         menu.append(self._tray_connect)
 
-        self._tray_disconnect = Gtk.MenuItem(label="Отключиться")
+        self._tray_disconnect = Gtk.MenuItem(label="Отключить")
         self._tray_disconnect.connect("activate", lambda _: self._window._on_disconnect())
         self._tray_disconnect.set_sensitive(False)
         menu.append(self._tray_disconnect)
